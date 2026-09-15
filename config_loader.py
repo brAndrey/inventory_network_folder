@@ -1,143 +1,207 @@
+"""Чтение и разбор конфигурационного INI-файла.
+
+Формат файла ``config.ini`` описан в README. Ключевая особенность — секция
+``[ROOTS]`` хранит пары ``адрес;глубина``, где глубина индивидуальна для
+каждого корня и может отсутствовать.
+"""
+
 from __future__ import annotations
 
 import configparser
+import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from models import MonitorPaths, RootConfig
 
-class InventoryPaths:
-    """
-    Хранит пути, которые должны быть рядом со скриптом:
-    - папку Report;
-    - папку Log;
-    - файл лога logs;
-    - имена INI-файлов.
-    """
+logger = logging.getLogger(__name__)
 
-    REPORT_DIR_NAME = "Report"
-    LOG_DIR_NAME = "Log"
-
-    # Если нужен файл логов с расширением, например logs.log,
-    # поменяйте на LOG_FILE_NAME = "logs.log"
-    LOG_FILE_NAME = "logs.log"
-
-    DEFAULT_CONFIG_NAMES = (
-        "folders.ini",
-        "config.ini",
-        "inventory.ini",
-    )
-
-    def __init__(self, base_file: Optional[Path] = None):
-        """
-        base_file - обычно путь к main.py.
-        Если не передан, используется путь к текущему файлу.
-        """
-        if base_file is None:
-            base_file = Path(__file__)
-
-        base = Path(base_file).resolve()
-
-        if base.is_dir():
-            self.base_dir = base
-        else:
-            self.base_dir = base.parent
-
-        self.report_dir = self.base_dir / self.REPORT_DIR_NAME
-        self.log_dir = self.base_dir / self.LOG_DIR_NAME
-        self.log_file = self.log_dir / self.LOG_FILE_NAME
+DEFAULT_CONFIG_NAME = "config.ini"
+DEFAULT_DEPTH = -1
 
 
 class ConfigLoader:
-    """
-    Класс для поиска и чтения INI-файла.
-    """
+    """Поиск и разбор ``config.ini`` рядом со скриптом."""
 
-    ROOT_SECTIONS = {
-        "roots",
-        "root",
-        "folders",
-        "folder",
-        "addresses",
-        "address",
-        "paths",
-        "path",
-    }
+    def __init__(self, base_dir: Path):
+        self.base_dir = Path(base_dir).resolve()
+        self.config_path: Optional[Path] = None
 
-    def __init__(self, paths: InventoryPaths):
-        self.paths = paths
-
+    # ------------------------------------------------------------------
+    # Поиск файла
+    # ------------------------------------------------------------------
     def find_config_path(self) -> Path:
-        """
-        Ищет INI рядом со скриптом.
+        """Возвращает путь к конфигурационному файлу.
 
-        Порядок:
-        1. Если передан аргумент командной строки, используем его.
-        2. Ищем folders.ini, config.ini, inventory.ini рядом со скриптом.
-        3. Если таких нет, берем первый найденный *.ini рядом со скриптом.
+        Порядок поиска:
+        1. Первый аргумент командной строки (файл или папка с INI).
+        2. ``config.ini`` рядом со скриптом.
         """
         if len(sys.argv) > 1:
             arg = Path(sys.argv[1].strip('"'))
-
             if not arg.is_absolute():
-                arg = self.paths.base_dir / arg
-
+                arg = self.base_dir / arg
             if arg.is_file():
                 return arg
-
             if arg.is_dir():
                 candidates = sorted(arg.glob("*.ini"))
                 if candidates:
                     return candidates[0]
-
             raise FileNotFoundError(
                 f"INI-файл из командной строки не найден: {sys.argv[1]}"
             )
 
-        for name in self.paths.DEFAULT_CONFIG_NAMES:
-            path = self.paths.base_dir / name
-            if path.is_file():
-                return path
-
-        candidates = sorted(self.paths.base_dir.glob("*.ini"))
-        if candidates:
-            return candidates[0]
+        path = self.base_dir / DEFAULT_CONFIG_NAME
+        if path.is_file():
+            return path
 
         raise FileNotFoundError(
-            f"Рядом со скриптом не найден INI-файл. "
-            f"Папка: {self.paths.base_dir}. "
-            f"Ожидалось одно из имен: {', '.join(self.paths.DEFAULT_CONFIG_NAMES)} "
-            f"или любой файл *.ini."
+            f"Рядом со скриптом не найден {DEFAULT_CONFIG_NAME}. "
+            f"Папка: {self.base_dir}"
         )
 
-    def load(self, config_path: Path) -> Tuple[List[str], Dict[str, str]]:
+    # ------------------------------------------------------------------
+    # Загрузка
+    # ------------------------------------------------------------------
+    def load(
+        self,
+        config_path: Optional[Path] = None,
+    ) -> Tuple[List[RootConfig], Dict[str, str]]:
+        """Читает конфиг и возвращает корни и опции.
+
+        Возвращает кортеж ``(roots, options)``, где ``roots`` — список
+        ``RootConfig``, а ``options`` — сырые строки из секции ``[OPTIONS]``.
+
+        Если ``config_path`` не задан, файл ищется через :meth:`find_config_path`.
         """
-        Читает INI и возвращает:
-        - список корневых папок;
-        - словарь опций из секции [OPTIONS].
-        """
-        parser = configparser.RawConfigParser(strict=False)
+        if config_path is None:
+            self.config_path = self.find_config_path()
+        else:
+            self.config_path = Path(config_path)
+
+        parser = configparser.RawConfigParser(strict=False, inline_comment_prefixes=None)
         parser.optionxform = str
 
-        text = self._read_text(config_path)
+        text = self._read_text(self.config_path)
         parser.read_string(text)
 
-        roots = self._collect_roots(parser)
-
-        if not roots:
-            roots = self._collect_roots_fallback(parser)
-
-        roots = self._unique_roots(roots)
-        options = self._collect_options(parser)
+        roots = self._parse_roots(parser)
+        options = self._parse_options(parser)
 
         return roots, options
 
+    def load_alerts(self) -> Dict[str, str]:
+        """Возвращает опции секции ``[ALERTS]`` (может отсутствовать)."""
+        if self.config_path is None:
+            self.config_path = self.find_config_path()
+
+        parser = configparser.RawConfigParser(strict=False, inline_comment_prefixes=None)
+        parser.optionxform = str
+        parser.read_string(self._read_text(self.config_path))
+
+        alerts: Dict[str, str] = {}
+        for section in parser.sections():
+            if section.strip().lower() == "alerts":
+                for key, value in parser.items(section):
+                    alerts[key.strip().lower()] = value
+        return alerts
+
+    def get_config_snapshot(self) -> str:
+        """Возвращает полный текст конфига для аудита (config_snapshot)."""
+        if self.config_path is None:
+            self.config_path = self.find_config_path()
+        return self._read_text(self.config_path)
+
+    # ------------------------------------------------------------------
+    # Разбор секций
+    # ------------------------------------------------------------------
+    def _parse_roots(self, parser: configparser.RawConfigParser) -> List[RootConfig]:
+        """Собирает корни из секции ``[ROOTS]``."""
+        roots: List[RootConfig] = []
+
+        for section in parser.sections():
+            if section.strip().lower() != "roots":
+                continue
+            for _, value in parser.items(section):
+                root = self._parse_root_line(value)
+                if root is not None:
+                    roots.append(root)
+
+        return roots
+
+    def _parse_options(self, parser: configparser.RawConfigParser) -> Dict[str, str]:
+        """Собирает опции из секции ``[OPTIONS]``."""
+        options: Dict[str, str] = {}
+
+        for section in parser.sections():
+            if section.strip().lower() != "options":
+                continue
+            for key, value in parser.items(section):
+                options[key.strip().lower()] = value
+
+        return options
+
+    # ------------------------------------------------------------------
+    # Разбор строки корня
+    # ------------------------------------------------------------------
+    def _parse_root_line(self, line: str) -> Optional[RootConfig]:
+        """Разбирает строку вида ``\\\\server\\share;3``.
+
+        Правила:
+        - ``path;depth`` -> ``path`` и ``depth``;
+        - ``path`` без ``;`` -> глубина ``-1`` (без ограничения);
+        - пробелы вокруг ``;`` игнорируются;
+        - если после ``;`` не число — логируется ошибка, глубина ``-1``.
+        """
+        raw = str(line or "").strip().strip('"')
+        if not raw:
+            return None
+
+        path_part = raw
+        depth_part = ""
+
+        if ";" in raw:
+            path_part, depth_part = raw.rsplit(";", 1)
+            path_part = path_part.strip().strip('"')
+            depth_part = depth_part.strip()
+
+        path_part = os.path.expandvars(os.path.expanduser(path_part))
+
+        if not os.path.isabs(path_part):
+            path_part = str((self.base_dir / path_part).resolve())
+
+        path_part = os.path.normpath(path_part)
+
+        if depth_part == "":
+            depth = DEFAULT_DEPTH
+        else:
+            depth = self.parse_int(depth_part, default=DEFAULT_DEPTH)
+            if not self._is_int(depth_part):
+                logger.error(
+                    "Некорректная глубина '%s' для корня '%s'. "
+                    "Используется глубина -1 (без ограничения).",
+                    depth_part,
+                    path_part,
+                )
+
+        return RootConfig(path=path_part, max_depth=depth)
+
+    @staticmethod
+    def _is_int(value: str) -> bool:
+        try:
+            int(str(value).strip())
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    # ------------------------------------------------------------------
+    # Вспомогательные
+    # ------------------------------------------------------------------
     def _read_text(self, config_path: Path) -> str:
-        """
-        Читает текст INI, пробуя несколько кодировок.
-        """
-        last_error = None
+        """Читает текст INI, пробуя несколько кодировок."""
+        last_error: Optional[Exception] = None
 
         for enc in ("utf-8-sig", "utf-8", "cp1251", "cp866"):
             try:
@@ -146,141 +210,14 @@ class ConfigLoader:
                 last_error = exc
                 continue
 
-        raise ValueError(
-            f"Не удалось определить кодировку INI-файла: {last_error}"
-        )
+        raise ValueError(f"Не удалось определить кодировку INI-файла: {last_error}")
 
-    def _collect_roots(self, parser: configparser.RawConfigParser) -> List[str]:
-        """
-        Собирает корни из секций [ROOTS], [FOLDERS] и аналогичных.
-        """
-        roots = []
-
-        for section in parser.sections():
-            if section.strip().lower() in self.ROOT_SECTIONS:
-                for _, value in parser.items(section):
-                    for raw in self._iter_ini_lines(value):
-                        path = self._expand_path(raw)
-                        if path:
-                            roots.append(path)
-
-        return roots
-
-    def _collect_roots_fallback(
-        self,
-        parser: configparser.RawConfigParser,
-    ) -> List[str]:
-        """
-        Запасной вариант: если явной секции с путями нет,
-        ищем абсолютные пути во всех секциях кроме OPTIONS.
-        """
-        roots = []
-
-        for section in parser.sections():
-            if section.strip().lower() == "options":
-                continue
-
-            for _, value in parser.items(section):
-                for raw in self._iter_ini_lines(value):
-                    if self._looks_like_path(raw):
-                        path = self._expand_path(raw)
-                        if path:
-                            roots.append(path)
-
-        return roots
-
-    def _collect_options(
-        self,
-        parser: configparser.RawConfigParser,
-    ) -> Dict[str, str]:
-        """
-        Собирает опции из секции [OPTIONS].
-        """
-        options = {}
-
-        for section in parser.sections():
-            if section.strip().lower() == "options":
-                for key, value in parser.items(section):
-                    options[key.strip().lower()] = value
-
-        return options
-
-    def _unique_roots(self, roots: List[str]) -> List[str]:
-        """
-        Убирает дубликаты корней, сохраняя порядок.
-        """
-        unique_roots = []
-        seen = set()
-
-        for root in roots:
-            key = os.path.normcase(root)
-            if key not in seen:
-                seen.add(key)
-                unique_roots.append(root)
-
-        return unique_roots
-
-    def _expand_path(self, raw: str) -> str:
-        """
-        Раскрывает переменные окружения и ~.
-        Относительные пути считает относительно папки скрипта.
-        """
-        raw = str(raw or "").strip().strip('"')
-
-        if not raw:
-            return ""
-
-        raw = os.path.expandvars(os.path.expanduser(raw))
-
-        if not os.path.isabs(raw):
-            raw = str((self.paths.base_dir / raw).resolve())
-
-        return os.path.normpath(raw)
-
+    # ------------------------------------------------------------------
+    # Статические парсеры значений
+    # ------------------------------------------------------------------
     @staticmethod
-    def _iter_ini_lines(value: str) -> Iterable[str]:
-        """
-        Разбивает значение INI на строки.
-
-        Это позволяет перечислять несколько путей в одном ключе:
-        roots =
-            \\server\share1
-            \\server\share2
-        """
-        for line in str(value or "").splitlines():
-            line = line.strip().strip('"')
-            if line:
-                yield line
-
-    @staticmethod
-    def _looks_like_path(value: str) -> bool:
-        """
-        Проверяет, похоже ли значение на путь.
-        """
-        v = str(value or "").strip().strip('"')
-
-        if not v:
-            return False
-
-        low = v.lower()
-
-        if low in {
-            "true",
-            "false",
-            "yes",
-            "no",
-            "on",
-            "off",
-            "1",
-            "0",
-        }:
-            return False
-
-        expanded = os.path.expandvars(os.path.expanduser(v))
-        return os.path.isabs(expanded)
-
-    @staticmethod
-    def parse_bool(value, default=False) -> bool:
+    def parse_bool(value, default: bool = False) -> bool:
+        """Преобразует строку в ``bool``; при ошибке возвращает ``default``."""
         if value is None:
             return default
 
@@ -295,37 +232,31 @@ class ConfigLoader:
         return default
 
     @staticmethod
-    def parse_int(value, default=0) -> int:
+    def parse_int(value, default: int = 0) -> int:
+        """Преобразует строку в ``int``; при ошибке возвращает ``default``."""
         try:
             return int(str(value).strip())
-        except Exception:
+        except (TypeError, ValueError):
             return default
 
-    @staticmethod
-    def parse_delimiter(value) -> str:
-        """
-        Поддерживает человекочитаемые значения:
-        delimiter = semicolon
-        delimiter = comma
-        delimiter = tab
-        """
-        if value is None:
-            return ";"
 
-        text = str(value).strip()
+def build_paths(base_dir: Path, options: Dict[str, str]) -> MonitorPaths:
+    """Строит ``MonitorPaths`` из каталога скрипта и опций конфига.
 
-        if not text:
-            return ";"
+    Относительные пути в опциях интерпретируются относительно ``base_dir``.
+    """
+    base_dir = Path(base_dir).resolve()
 
-        low = text.lower()
+    def resolve(value: str, default: str) -> Path:
+        raw = str(value).strip() or default
+        path = Path(raw)
+        if not path.is_absolute():
+            path = base_dir / path
+        return path
 
-        if low in {"semicolon", ";"}:
-            return ";"
-
-        if low == "tab":
-            return "\t"
-
-        if low in {"comma", ","}:
-            return ","
-
-        return text[0]
+    return MonitorPaths(
+        base_dir=base_dir,
+        db_path=resolve(options.get("db_path", "folder_monitor.db"), "folder_monitor.db"),
+        log_dir=resolve(options.get("log_dir", "Log"), "Log"),
+        report_dir=resolve(options.get("report_dir", "Reports"), "Reports"),
+    )

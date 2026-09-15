@@ -1,66 +1,67 @@
+"""Настройка логирования: консоль и файл с ротацией.
+
+Лог пишется в ``<log_dir>/monitor.log`` с ротацией 5 файлов по 5 МБ.
+Формат строки: ``2026-09-09 14:00:01 [INFO] Сообщение``.
+"""
+
 from __future__ import annotations
 
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
-from config_loader import InventoryPaths
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FILE_NAME = "monitor.log"
+MAX_BYTES = 5 * 1024 * 1024
+BACKUP_COUNT = 5
 
 
-class LoggerFactory:
+def setup_logger(log_dir: Path, log_file_name: str = LOG_FILE_NAME) -> logging.Logger:
+    """Конфигурирует корневой логгер и возвращает его.
+
+    Консольный обработчик добавляется, только если доступен ``sys.stderr``.
+    Файловый обработчик добавляется с ротацией; при ошибке доступа к файлу
+    лог остаётся только в консоли.
     """
-    Класс для создания логгера.
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
-    Лог пишется:
-    - в консоль, если есть stderr;
-    - в файл Log/logs.
+    # Убираем ранее добавленные обработчики, чтобы setup_logger был идемпотентным.
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
-    Используется ротация логов:
-    - основной файл logs;
-    - резервные копии logs.1 ... logs.5.
-    """
+    formatter = logging.Formatter(fmt=LOG_FORMAT, datefmt=DATE_FORMAT)
 
-    def __init__(self, paths: InventoryPaths):
-        self.paths = paths
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
-    def create_logger(self, name: str = "inventory_folders") -> logging.Logger:
-        logger = logging.getLogger(name)
-        logger.setLevel(logging.INFO)
+    try:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
 
-        if logger.handlers:
-            return logger
-
-        formatter = logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+        file_handler = RotatingFileHandler(
+            log_dir / log_file_name,
+            maxBytes=MAX_BYTES,
+            backupCount=BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except Exception as exc:
+        logger.warning(
+            "Не удалось создать файл лога %s: %s. Лог будет только в консоли.",
+            log_dir / log_file_name,
+            exc,
         )
 
-        # Консольный вывод добавляем только если есть stderr.
-        # Это полезно, если скрипт запускается через pythonw или скрыто.
-        if sys.stderr is not None:
-            console_handler = logging.StreamHandler()
-            console_handler.setLevel(logging.INFO)
-            console_handler.setFormatter(formatter)
-            logger.addHandler(console_handler)
-
-        try:
-            self.paths.log_dir.mkdir(parents=True, exist_ok=True)
-
-            file_handler = RotatingFileHandler(
-                self.paths.log_file,
-                maxBytes=5 * 1024 * 1024,
-                backupCount=5,
-                encoding="utf-8",
-            )
-            file_handler.setLevel(logging.INFO)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
-
-        except Exception as exc:
-            # Если файловый лог создать не удалось, оставляем хотя бы консольный.
-            logger.warning(
-                f"Не удалось создать файл лога {self.paths.log_file}: {exc}. "
-                "Лог будет только в консоли."
-            )
-
-        return logger
+    return logger

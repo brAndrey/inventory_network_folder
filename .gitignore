@@ -1,1 +1,15 @@
+# Отчёты, логи и база данных не коммитятся.
+/Reports/
 /Report/
+/Log/
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# Кэш Python.
+__pycache__/
+*.pyc
+
+# Старый конфиг инвентаризации (заменён на config.ini).
+folders.ini
