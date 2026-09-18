@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -443,11 +444,104 @@ class MonitorApp:
     # ------------------------------------------------------------------
     # Оповещения
     # ------------------------------------------------------------------
+    def _alerts_enabled(self) -> bool:
+        """True, если секция [ALERTS] включена (enabled = true)."""
+        return self.config_loader.parse_bool(self.alerts.get("enabled"), False)
+
+    @staticmethod
+    def _has_alertable_changes(diff: DiffResult) -> bool:
+        """True, если есть изменения, требующие оповещения.
+
+        Оповещение необходимо только при перемещении, удалении папки или
+        аномальном уменьшении количества файлов.
+        """
+        return bool(diff.moved or diff.deleted or diff.file_count_decreased)
+
+    @staticmethod
+    def _display_path(root: str, relative_path: str) -> str:
+        """Склеивает корень и относительный путь для отображения в письме."""
+        if not relative_path:
+            return root
+        return f"{root}\\{relative_path.replace('/', '\\')}"
+
+    @staticmethod
+    def _build_email_subject(diff: DiffResult, scan_id: int) -> str:
+        """Тема письма с краткой сводкой изменений."""
+        parts = []
+        if diff.moved:
+            parts.append(f"перемещено {len(diff.moved)}")
+        if diff.deleted:
+            parts.append(f"удалено {len(diff.deleted)}")
+        if diff.file_count_decreased:
+            parts.append(f"аномалий {len(diff.file_count_decreased)}")
+        summary = ", ".join(parts) if parts else "без изменений"
+        return f"Мониторинг папок: скан #{scan_id} — {summary}"
+
+    @staticmethod
+    def _build_email_body(diff: DiffResult, scan_id: int) -> str:
+        """Тело письма с деталями изменений."""
+        lines = [f"Скан #{scan_id}. Обнаружены изменения:"]
+
+        if diff.moved:
+            lines.append("")
+            lines.append(f"Перемещённые папки ({len(diff.moved)}):")
+            for m in diff.moved:
+                old = MonitorApp._display_path(m.root, m.old_path)
+                new = MonitorApp._display_path(m.root, m.new_path)
+                lines.append(
+                    f"  - {m.folder_name}: {old} -> {new} "
+                    f"(уверенность: {m.confidence}, файлов: {m.file_count})"
+                )
+
+        if diff.deleted:
+            lines.append("")
+            lines.append(f"Удалённые папки ({len(diff.deleted)}):")
+            for f in diff.deleted:
+                path = MonitorApp._display_path(f.root, f.relative_path)
+                lines.append(f"  - {f.folder_name}: {path} (файлов: {f.file_count})")
+
+        if diff.file_count_decreased:
+            lines.append("")
+            lines.append(
+                f"Аномальное уменьшение файлов ({len(diff.file_count_decreased)}):"
+            )
+            for a in diff.file_count_decreased:
+                path = MonitorApp._display_path(a.root, a.relative_path)
+                lines.append(
+                    f"  - {a.folder_name}: {path} — было {a.old_file_count}, "
+                    f"стало {a.new_file_count} (-{a.decrease_percent:.1f}%)"
+                )
+
+        return "\n".join(lines)
+
+    def _smtp_credentials(self) -> tuple:
+        """Возвращает (пользователь, пароль) для SMTP-авторизации.
+
+        Приоритет: переменные окружения ``MONITOR_SMTP_USER`` и
+        ``MONITOR_SMTP_PASSWORD``, затем опции ``smtp_user`` / ``smtp_password``
+        из секции ``[ALERTS]`` конфига.
+        """
+        user = os.environ.get(
+            "MONITOR_SMTP_USER", self.alerts.get("smtp_user", "")
+        ).strip()
+        password = os.environ.get(
+            "MONITOR_SMTP_PASSWORD", self.alerts.get("smtp_password", "")
+        ).strip()
+        return user, password
+
     def _send_alert_email(self, diff: Optional[DiffResult], scan_id: int) -> None:
-        """Опционально отправляет письмо со сводкой (секция [ALERTS])."""
-        if not self.alerts.get("enabled", "false").strip().lower() in {
-            "1", "true", "yes", "on", "да",
-        }:
+        """Отправляет письмо только при значимых изменениях (секция [ALERTS]).
+
+        Письмо отправляется, если есть перемещённые, удалённые папки или папки
+        с аномальным уменьшением количества файлов.
+        """
+        if not self._alerts_enabled():
+            return
+
+        if diff is None or not self._has_alertable_changes(diff):
+            self.logger.info(
+                "Изменений, требующих оповещения, нет — письмо не отправляется."
+            )
             return
 
         email_to = self.alerts.get("email_to", "")
@@ -459,14 +553,9 @@ class MonitorApp:
             import smtplib
             from email.mime.text import MIMEText
 
-            diff = diff or DiffResult()
-            subject = f"Мониторинг папок: скан #{scan_id}"
-            body = (
-                f"Скан #{scan_id} завершён.\n"
-                f"Создано: {len(diff.created)}, удалено: {len(diff.deleted)}, "
-                f"перемещено: {len(diff.moved)}, "
-                f"аномалий: {len(diff.file_count_decreased)}."
-            )
+            subject = self._build_email_subject(diff, scan_id)
+            body = self._build_email_body(diff, scan_id)
+
             message = MIMEText(body, "plain", "utf-8")
             message["Subject"] = subject
             message["From"] = self.alerts.get("email_from", email_to)
@@ -479,12 +568,16 @@ class MonitorApp:
                 self.logger.warning("[ALERTS] enabled, но smtp_server не задан.")
                 return
 
+            smtp_user, smtp_password = self._smtp_credentials()
+
             with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
+                if smtp_user:
+                    server.login(smtp_user, smtp_password)
                 server.sendmail(message["From"], [email_to], message.as_string())
-            self.logger.info(f"Оповещение отправлено на {email_to}")
+            self.logger.info(f"Оповещение отправлено на {email_to}: {subject}")
         except Exception as exc:
             self.logger.warning(f"Не удалось отправить оповещение: {exc}")
 
