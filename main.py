@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime
@@ -27,6 +26,7 @@ from database import (
     ScanRepository,
 )
 from diff_engine import DiffEngine
+from email_sender import EmailSendError, send_email, smtp_credentials
 from logger_setup import setup_logger
 from models import DiffResult, MonitorPaths, RootConfig
 from report_generator import ReportGenerator
@@ -517,69 +517,56 @@ class MonitorApp:
     def _smtp_credentials(self) -> tuple:
         """Возвращает (пользователь, пароль) для SMTP-авторизации.
 
-        Приоритет: переменные окружения ``MONITOR_SMTP_USER`` и
-        ``MONITOR_SMTP_PASSWORD``, затем опции ``smtp_user`` / ``smtp_password``
-        из секции ``[ALERTS]`` конфига.
+        Делегирует в :func:`email_sender.smtp_credentials`.
         """
-        user = os.environ.get(
-            "MONITOR_SMTP_USER", self.alerts.get("smtp_user", "")
-        ).strip()
-        password = os.environ.get(
-            "MONITOR_SMTP_PASSWORD", self.alerts.get("smtp_password", "")
-        ).strip()
-        return user, password
+        return smtp_credentials(self.alerts)
 
     def _send_alert_email(self, diff: Optional[DiffResult], scan_id: int) -> None:
         """Отправляет письмо только при значимых изменениях (секция [ALERTS]).
 
         Письмо отправляется, если есть перемещённые, удалённые папки или папки
-        с аномальным уменьшением количества файлов.
+        с аномальным уменьшением количества файлов. Итог (отправлено или нет)
+        всегда фиксируется в логе.
         """
         if not self._alerts_enabled():
+            self.logger.info("[ALERTS] выключены — отчёт по e-mail не отправляется.")
             return
 
         if diff is None or not self._has_alertable_changes(diff):
             self.logger.info(
-                "Изменений, требующих оповещения, нет — письмо не отправляется."
+                "Изменений, требующих оповещения, нет — отчёт по e-mail не отправляется."
             )
             return
 
         email_to = self.alerts.get("email_to", "")
         if not email_to:
-            self.logger.warning("[ALERTS] enabled, но email_to не задан.")
+            self.logger.warning("[ALERTS] включены, но email_to не задан — отчёт не отправляется.")
             return
 
+        smtp_server = self.alerts.get("smtp_server", "")
+        if not smtp_server:
+            self.logger.warning("[ALERTS] включены, но smtp_server не задан — отчёт не отправляется.")
+            return
+
+        subject = self._build_email_subject(diff, scan_id)
+        body = self._build_email_body(diff, scan_id)
+        smtp_port = self.config_loader.parse_int(self.alerts.get("smtp_port"), 587)
+        smtp_user, smtp_password = self._smtp_credentials()
+
         try:
-            import smtplib
-            from email.mime.text import MIMEText
-
-            subject = self._build_email_subject(diff, scan_id)
-            body = self._build_email_body(diff, scan_id)
-
-            message = MIMEText(body, "plain", "utf-8")
-            message["Subject"] = subject
-            message["From"] = self.alerts.get("email_from", email_to)
-            message["To"] = email_to
-
-            smtp_server = self.alerts.get("smtp_server", "")
-            smtp_port = int(self.alerts.get("smtp_port", "587"))
-
-            if not smtp_server:
-                self.logger.warning("[ALERTS] enabled, но smtp_server не задан.")
-                return
-
-            smtp_user, smtp_password = self._smtp_credentials()
-
-            with smtplib.SMTP(smtp_server, smtp_port, timeout=30) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                if smtp_user:
-                    server.login(smtp_user, smtp_password)
-                server.sendmail(message["From"], [email_to], message.as_string())
-            self.logger.info(f"Оповещение отправлено на {email_to}: {subject}")
-        except Exception as exc:
-            self.logger.warning(f"Не удалось отправить оповещение: {exc}")
+            send_email(
+                to=email_to,
+                subject=subject,
+                body=body,
+                smtp_server=smtp_server,
+                smtp_port=smtp_port,
+                from_addr=self.alerts.get("email_from", email_to),
+                smtp_user=smtp_user,
+                smtp_password=smtp_password,
+            )
+            self.logger.info(f"Отчёт по e-mail отправлен на {email_to}: {subject}")
+        except EmailSendError as exc:
+            self.logger.exception("Не удалось отправить отчёт по e-mail: %s", exc)
 
     # ------------------------------------------------------------------
     # Очистка
