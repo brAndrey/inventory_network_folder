@@ -11,14 +11,13 @@
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 from typing import List
 
 from config_loader import ConfigLoader, build_paths
 from email_sender import EmailSendError, send_email, smtp_credentials
-from logger_setup import setup_logger
+from logger_setup import log_startup, setup_logger
 
 # Коды завершения.
 EXIT_OK = 0
@@ -62,24 +61,22 @@ def main() -> int:
     """Точка входа принудительной отправки последнего отчёта."""
     base_dir = Path(__file__).resolve().parent
 
-    # Базовый консольный логгер на случай ошибок чтения конфига.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logger = logging.getLogger("folder_monitor")
+    # Ранний файловый логгер (папка Log по умолчанию), чтобы ошибки чтения
+    # config.ini попадали в лог-файл, а не только в консоль.
+    logger = setup_logger(base_dir / "Log")
 
     loader = ConfigLoader(base_dir)
     try:
         _, raw_options = loader.load()
         alerts = loader.load_alerts()
     except Exception as exc:
-        logger.error(f"Ошибка загрузки конфигурации: {exc}")
+        logger.error("Не удалось загрузить config.ini: %s", exc)
         return EXIT_CONFIG_ERROR
 
     paths = build_paths(base_dir, raw_options)
     logger = setup_logger(paths.log_dir)
+
+    log_startup(logger, "принудительной отправки отчёта", Path(__file__).resolve())
 
     if not loader.parse_bool(alerts.get("enabled"), False):
         logger.error("[ALERTS] выключены — принудительная отправка невозможна.")
@@ -95,6 +92,7 @@ def main() -> int:
         logger.error("[ALERTS] включены, но smtp_server не задан.")
         return EXIT_CONFIG_ERROR
 
+    logger.info("Поиск последнего отчёта в %s...", paths.report_dir)
     attachments = find_last_report_attachments(paths.report_dir)
     if not attachments:
         logger.error(f"В {paths.report_dir} не найдено ни одного отчёта (report_*.html).")
@@ -118,6 +116,7 @@ def main() -> int:
     body_lines.extend(f"  - {p.name}" for p in attachments)
     body = "\n".join(body_lines)
 
+    logger.info("Отправка отчёта на %s (SMTP %s:%s)...", email_to, smtp_server, smtp_port)
     try:
         send_email(
             to=email_to,

@@ -27,7 +27,7 @@ from database import (
 )
 from diff_engine import DiffEngine
 from email_sender import EmailSendError, send_email, smtp_credentials
-from logger_setup import setup_logger
+from logger_setup import log_startup, setup_logger
 from models import DiffResult, MonitorPaths, RootConfig
 from report_generator import ReportGenerator
 from scanner import FolderScanner, ScanTimeoutError
@@ -74,11 +74,15 @@ class MonitorApp:
     # ------------------------------------------------------------------
     def run(self) -> int:
         """Запускает полный цикл мониторинга и возвращает код завершения."""
+        # Ранний файловый логгер (папка Log по умолчанию), чтобы ошибки чтения
+        # config.ini попадали в лог-файл, а не только в консоль.
+        self.logger = setup_logger(self.base_dir / "Log")
+
         roots = self._load_config()
         if roots is None:
             return EXIT_CONFIG_ERROR
 
-        self.logger.info("=== Начало мониторинга папок ===")
+        log_startup(self.logger, "мониторинга папок", Path(__file__).resolve())
         self.logger.info(f"Корней для сканирования: {len(roots)}")
         for rc in roots:
             self.logger.info(f"  {rc.path} (глубина {rc.max_depth})")
@@ -126,11 +130,11 @@ class MonitorApp:
         try:
             roots, raw_options = self.config_loader.load()
         except Exception as exc:
-            self.logger.error(f"Ошибка загрузки конфигурации: {exc}")
+            self.logger.error("Не удалось загрузить config.ini: %s", exc)
             return None
 
         if not roots:
-            self.logger.error("В конфигурации не найдены корни (секция [ROOTS]).")
+            self.logger.error("В config.ini не найдены корни (секция [ROOTS]).")
             return None
 
         self.options = self._parse_options(raw_options)
@@ -173,6 +177,7 @@ class MonitorApp:
     # ------------------------------------------------------------------
     def _init_database(self) -> bool:
         """Создаёт соединение и схему БД."""
+        self.logger.info("Инициализация базы данных: %s", self.paths.db_path)
         try:
             self.db_manager = DatabaseManager(self.paths.db_path)
             self.db_manager.create_schema()
@@ -199,6 +204,10 @@ class MonitorApp:
         запуски. Возвращает True, только если остался «живой» running-скан.
         """
         stale_hours = self.options.get("stale_scan_hours", STALE_RUNNING_HOURS)
+
+        self.logger.info(
+            "Проверка незавершённых/зависших сканов (порог %s ч)...", stale_hours
+        )
 
         running_ids = self.scan_repo.get_running_scans()
         if not running_ids:
@@ -236,6 +245,7 @@ class MonitorApp:
     # ------------------------------------------------------------------
     def _start_scan(self, roots: List[RootConfig]) -> Optional[int]:
         """Создаёт запись скана со статусом 'running'."""
+        self.logger.info("Создание записи скана...")
         try:
             snapshot = self.config_loader.get_config_snapshot()
             scan_id = self.scan_repo.start_scan(snapshot)
@@ -256,6 +266,12 @@ class MonitorApp:
         scanner = FolderScanner(self.options, self.logger)
         timeout_seconds = self.options["scan_timeout_minutes"] * 60
         deadline = time.monotonic() + timeout_seconds
+
+        self.logger.info(
+            "Выполнение сканирования: %d корней, лимит %d мин...",
+            len(roots),
+            self.options["scan_timeout_minutes"],
+        )
 
         all_folders = []
         all_errors = []
@@ -352,6 +368,7 @@ class MonitorApp:
         new_scan_id: int,
     ) -> DiffResult:
         """Сравнивает сканы и сохраняет события/перемещения в БД."""
+        self.logger.info("Сравнение сканов #%s -> #%s...", prev_scan_id, new_scan_id)
         engine = DiffEngine(self.db_manager, self.logger)
         diff = engine.compare_scans(prev_scan_id, new_scan_id, self.options)
 
@@ -430,6 +447,7 @@ class MonitorApp:
     # ------------------------------------------------------------------
     def _generate_reports(self, scan_id: int, diff: Optional[DiffResult]) -> None:
         """Создаёт CSV и HTML отчёты в папке Reports."""
+        self.logger.info("Генерация отчётов (скан #%s)...", scan_id)
         try:
             self.paths.report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -545,6 +563,7 @@ class MonitorApp:
         с аномальным уменьшением количества файлов. Итог (отправлено или нет)
         всегда фиксируется в логе.
         """
+        self.logger.info("Обработка e-mail оповещения (скан #%s)...", scan_id)
         if not self._alerts_enabled():
             self.logger.info("[ALERTS] выключены — отчёт по e-mail не отправляется.")
             return
@@ -590,6 +609,7 @@ class MonitorApp:
     # ------------------------------------------------------------------
     def _cleanup(self) -> None:
         """Удаляет старые сканы и выполняет VACUUM не чаще раза в сутки."""
+        self.logger.info("Очистка старых данных...")
         try:
             cleanup = CleanupService(self.db_manager, self.logger)
             cleanup.delete_old_scans(self.options.get("retention_days", 7))

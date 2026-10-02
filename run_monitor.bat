@@ -1,44 +1,58 @@
 @echo off
-rem ============================================================
-rem  run_monitor.bat
-rem
-rem  Запуск main.py рядом с этим bat-файлом.
-rem  Предназначен для Планировщика задач Windows (без pause).
-rem
-rem  Можно задать явный путь к Python:
-rem      set MONITOR_PYTHON_EXE=C:\Python311\python.exe
-rem ============================================================
-
 setlocal enabledelayedexpansion
 chcp 65001 >nul
 
 set "SCRIPT_DIR=%~dp0"
 set "PYTHONUTF8=1"
+set "MONITOR_ENTRY_BAT=run_monitor.bat"
 set "PYFILE=%SCRIPT_DIR%main.py"
 
+set "LOG_DIR=%SCRIPT_DIR%Log"
+set "BAT_LOG=%LOG_DIR%\bat.log"
+
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" 2>nul
+
+call :log "=== START ==="
+call :log "script: %PYFILE%"
+
 if not exist "%PYFILE%" (
+    call :log "ERROR: script not found"
     echo [ERROR] Python script not found: %PYFILE%
+    echo Log file: "%BAT_LOG%"
     exit /b 1
 )
 
-rem Явно указанный Python имеет приоритет.
 if defined MONITOR_PYTHON_EXE (
-    "%MONITOR_PYTHON_EXE%" "%PYFILE%" %*
-    exit /b !errorlevel!
+    call :log "python: %MONITOR_PYTHON_EXE%"
+    "%MONITOR_PYTHON_EXE%" "%PYFILE%" %* >>"%BAT_LOG%" 2>&1
+    set "PY_EXIT=!errorlevel!"
+    call :log "exit code: !PY_EXIT!"
+    exit /b !PY_EXIT!
 )
 
-rem Пробуем py -3, затем python.
 where py >nul 2>nul
 if !errorlevel! equ 0 (
-    py -3 "%PYFILE%" %*
-    exit /b !errorlevel!
+    call :log "python: py -3"
+    py -3 "%PYFILE%" %* >>"%BAT_LOG%" 2>&1
+    set "PY_EXIT=!errorlevel!"
+    call :log "exit code: !PY_EXIT!"
+    exit /b !PY_EXIT!
 )
 
 where python >nul 2>nul
 if !errorlevel! equ 0 (
-    python "%PYFILE%" %*
-    exit /b !errorlevel!
+    call :log "python: python"
+    python "%PYFILE%" %* >>"%BAT_LOG%" 2>&1
+    set "PY_EXIT=!errorlevel!"
+    call :log "exit code: !PY_EXIT!"
+    exit /b !PY_EXIT!
 )
 
+call :log "ERROR: Python 3 not found"
 echo [ERROR] Python 3 not found. Install Python, py launcher, or set MONITOR_PYTHON_EXE.
+echo Log file: "%BAT_LOG%"
 exit /b 1
+
+:log
+>>"%BAT_LOG%" echo [%date% %time:~0,8%] %MONITOR_ENTRY_BAT%: %~1
+goto :eof

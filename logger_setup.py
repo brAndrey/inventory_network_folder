@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -16,6 +17,24 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 LOG_FILE_NAME = "monitor.log"
 MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 5
+
+
+def log_startup(logger: logging.Logger, script_name: str, script_path: Path) -> None:
+    """Логирует сведения о запуске скрипта для диагностики.
+
+    Пишет имя скрипта, путь, аргументы командной строки, рабочую папку,
+    PID и версию Python. Если скрипт запущен bat-файлом, тот помечает себя
+    переменной окружения ``MONITOR_ENTRY_BAT`` — её значение также попадает
+    в лог.
+    """
+    logger.info("=== Запуск %s ===", script_name)
+    logger.info("Скрипт: %s", Path(script_path).resolve())
+    logger.info("Аргументы: %s", sys.argv[1:] or "(без аргументов)")
+    logger.info("Рабочая папка: %s", Path.cwd())
+    entry_bat = os.environ.get("MONITOR_ENTRY_BAT")
+    if entry_bat:
+        logger.info("Запуск через: %s", entry_bat)
+    logger.info("PID: %s, Python: %s", os.getpid(), sys.version.split()[0])
 
 
 def setup_logger(log_dir: Path, log_file_name: str = LOG_FILE_NAME) -> logging.Logger:
