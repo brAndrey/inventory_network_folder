@@ -163,6 +163,9 @@ class MonitorApp:
             "count_hidden_files": self.config_loader.parse_bool(
                 raw_options.get("count_hidden_files"), True
             ),
+            "stale_scan_hours": self.config_loader.parse_int(
+                raw_options.get("stale_scan_hours"), STALE_RUNNING_HOURS
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -188,31 +191,45 @@ class MonitorApp:
     # Защита от повторного запуска
     # ------------------------------------------------------------------
     def _check_duplicate_run(self) -> bool:
-        """Защита от параллельного запуска и зависших процессов.
+        """Защита от параллельного запуска и сброс зависших сканов.
 
-        Возвращает True, если новый скан запускать нельзя (есть незавершённый
-        скан). Для сканов старше ``STALE_RUNNING_HOURS`` дополнительно пишется
-        событие ``timeout_warning``.
+        Скан со статусом 'running', который висит дольше ``stale_scan_hours``
+        часов, считается зависшим (например, после перезагрузки ПК) и
+        автоматически помечается как 'failed', чтобы не блокировать новые
+        запуски. Возвращает True, только если остался «живой» running-скан.
         """
+        stale_hours = self.options.get("stale_scan_hours", STALE_RUNNING_HOURS)
+
         running_ids = self.scan_repo.get_running_scans()
         if not running_ids:
             return False
 
-        stale_ids = self.scan_repo.get_running_scans_older_than(STALE_RUNNING_HOURS)
+        stale_ids = self.scan_repo.get_running_scans_older_than(stale_hours)
         for rid in stale_ids:
+            self.scan_repo.mark_scan_stale(rid)
             self.event_repo.add_event(
                 rid,
-                "timeout_warning",
+                "stale_scan_reset",
                 details=json.dumps(
-                    {"message": f"Скан выполняется дольше {STALE_RUNNING_HOURS} ч"}
+                    {"message": f"Скан висел дольше {stale_hours} ч и был сброшен"}
                 ),
             )
+            self.logger.warning(
+                "Скан #%s висел в статусе running дольше %s ч — сброшен (статус 'failed').",
+                rid,
+                stale_hours,
+            )
 
-        self.logger.warning(
-            "Обнаружен незавершённый скан (running): %s. Новый скан не запускается.",
-            running_ids,
-        )
-        return True
+        stale_set = set(stale_ids)
+        remaining = [rid for rid in running_ids if rid not in stale_set]
+        if remaining:
+            self.logger.warning(
+                "Обнаружен незавершённый скан (running): %s. Новый скан не запускается.",
+                remaining,
+            )
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Сканирование

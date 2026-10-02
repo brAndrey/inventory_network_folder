@@ -108,3 +108,60 @@ def test_running_scans_older_than(tmp_path):
     assert recent_id not in repo.get_running_scans_older_than(hours=2)
 
     db.close()
+
+
+def test_stale_scan_is_reset_and_does_not_block(tmp_path):
+    app = MonitorApp()
+    app.logger = logging.getLogger("test_stale_reset")
+    app.options = {"stale_scan_hours": 2}
+
+    db = DatabaseManager(tmp_path / "test.db")
+    db.create_schema()
+    app.db_manager = db
+    app.scan_repo = ScanRepository(db)
+    app.event_repo = EventRepository(db)
+
+    stale_time = (datetime.now() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_id = _insert_scan_with_started_at(db, stale_time, status="running")
+
+    # Зависший скан сбрасывается и больше не блокирует новый запуск.
+    assert app._check_duplicate_run() is False
+
+    conn = db.get_connection()
+    status = conn.execute(
+        "SELECT status FROM scans WHERE id = ?", (stale_id,)
+    ).fetchone()["status"]
+    assert status == "failed"
+
+    db.close()
+
+
+def test_recent_running_scan_blocks_after_stale_reset(tmp_path):
+    app = MonitorApp()
+    app.logger = logging.getLogger("test_stale_blocks_recent")
+    app.options = {"stale_scan_hours": 2}
+
+    db = DatabaseManager(tmp_path / "test.db")
+    db.create_schema()
+    app.db_manager = db
+    app.scan_repo = ScanRepository(db)
+    app.event_repo = EventRepository(db)
+
+    stale_time = (datetime.now() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+    stale_id = _insert_scan_with_started_at(db, stale_time, status="running")
+    recent_id = app.scan_repo.start_scan(None)
+
+    # Зависший сброшен, но «живой» running-скан всё ещё блокирует запуск.
+    assert app._check_duplicate_run() is True
+
+    conn = db.get_connection()
+    stale_status = conn.execute(
+        "SELECT status FROM scans WHERE id = ?", (stale_id,)
+    ).fetchone()["status"]
+    recent_status = conn.execute(
+        "SELECT status FROM scans WHERE id = ?", (recent_id,)
+    ).fetchone()["status"]
+    assert stale_status == "failed"
+    assert recent_status == "running"
+
+    db.close()

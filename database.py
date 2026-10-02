@@ -213,6 +213,20 @@ class ScanRepository:
                 result.append(int(row["id"]))
         return result
 
+    def mark_scan_stale(self, scan_id: int) -> None:
+        """Помечает зависший running-скан как 'failed'.
+
+        Используется для сброса заданий, прерванных перезагрузкой ПК или
+        принудительным завершением процесса.
+        """
+        conn = self.db.get_connection()
+        conn.execute(
+            "UPDATE scans SET finished_at = ?, status = 'failed' "
+            "WHERE id = ? AND status = 'running'",
+            (now_str(), scan_id),
+        )
+        conn.commit()
+
 
 class FolderRepository:
     """Работа с таблицей ``folders``."""
